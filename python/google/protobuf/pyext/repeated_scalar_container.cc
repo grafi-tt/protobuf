@@ -33,7 +33,9 @@
 
 #include <google/protobuf/pyext/repeated_scalar_container.h>
 
+#include <cstring>
 #include <memory>
+#include <vector>
 #ifndef _SHARED_PTR_H
 #include <google/protobuf/stubs/shared_ptr.h>
 #endif
@@ -497,9 +499,388 @@ static int AssSubscript(RepeatedScalarContainer* self,
   return InternalAssignRepeatedField(self, new_list.get());
 }
 
-PyObject* Extend(RepeatedScalarContainer* self, PyObject* value) {
-  cmessage::AssureWritable(self->parent);
+static int InternalPyBufferCheck(Py_buffer* view,
+                                 FieldDescriptor::CppType cpp_typ) {
+  char* format = view->format;
+  if (strchr("@=<>!", format[0])) {
+    if (strchr("<>!", format[0])) {
+      PyErr_SetString(PyExc_NotImplementedError,
+                      "Currently only native endian is supported");
+      return -1;
+    }
+    format++;
+  }
+  if (strlen(format) > 1) {
+    PyErr_SetString(PyExc_TypeError, "Buffer cannot be composite type");
+    return -1;
+  }
 
+  char typ = format[0];
+  switch (cpp_typ) {
+    case FieldDescriptor::CPPTYPE_INT32:
+    case FieldDescriptor::CPPTYPE_UINT32: {
+      if (!strchr("hHiIlLqQnN", typ)) {
+        PyErr_SetString(PyExc_TypeError, "Buffer is not integer type");
+        return -1;
+      }
+      if (view->itemsize != 4) {
+        PyErr_SetString(PyExc_TypeError, "Integer size of buffer is not 4");
+        return -1;
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_INT64:
+    case FieldDescriptor::CPPTYPE_UINT64: {
+      if (!strchr("hHiIlLqQnN", typ)) {
+        PyErr_SetString(PyExc_TypeError, "Buffer is not integer type");
+        return -1;
+      }
+      if (view->itemsize != 8) {
+        PyErr_SetString(PyExc_TypeError, "Integer size of buffer is not 8");
+        return -1;
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_FLOAT: {
+      if (typ != 'f') {
+        PyErr_SetString(PyExc_TypeError, "Buffer is not 32bits float type");
+        return -1;
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_DOUBLE: {
+      if (typ != 'd') {
+        PyErr_SetString(PyExc_TypeError, "Buffer is not 64bits float type");
+        return -1;
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_BOOL: {
+      if (typ != '?') {
+        PyErr_SetString(PyExc_TypeError, "Buffer is not boolean type");
+        return -1;
+      }
+      break;
+    }
+    default: {
+      PyErr_SetString(PyExc_TypeError, "Prototype field is non-number type");
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+static char* InternalPyBufferPtr(
+    Py_buffer* view, std::vector<Py_ssize_t>& indices) {
+  int ndim = view->ndim;
+  Py_ssize_t* shape = view->shape;
+  Py_ssize_t* strides = view->strides;
+  Py_ssize_t* suboffsets = view->suboffsets;
+  char* p = reinterpret_cast<char*>(view->buf);
+
+  for (int k = 0; k < ndim; k++) {
+    p += strides[k] * indices[k];
+    if (suboffsets && suboffsets[k] >= 0) {
+      p = *(reinterpret_cast<char**>(p)) + suboffsets[k];
+    }
+  }
+  bool incr = true;
+  for (int k = ndim - 1; k >= 0; k--) {
+    if (incr) {
+      if (++(indices[k]) == shape[k]) {
+        indices[k] = 0;
+      } else {
+        incr = false;
+      }
+    }
+  }
+  return p;
+}
+
+static PyObject* Fill(RepeatedScalarContainer* self, PyObject* exporter) {
+  Message* message = self->message;
+  const FieldDescriptor* field_descriptor = self->parent_field_descriptor;
+  const Reflection* reflection = message->GetReflection();
+
+  FieldDescriptor::CppType cpp_typ = field_descriptor->cpp_type();
+  int field_size = reflection->FieldSize(*message, field_descriptor);
+
+  Py_buffer view[1];
+  if (PyObject_GetBuffer(exporter, view, PyBUF_FULL_RO)) {
+    return NULL;
+  }
+
+  if (field_size * view->itemsize != view->len) {
+    PyErr_SetString(PyExc_ValueError, "Buffer size doesn't match");
+    PyBuffer_Release(view);
+    return NULL;
+  }
+
+  if (InternalPyBufferCheck(view, cpp_typ)) {
+    PyBuffer_Release(view);
+    return NULL;
+  }
+
+  bool is_contiguous = PyBuffer_IsContiguous(view, 'C');
+  vector<Py_ssize_t> indices(view->ndim, 0);
+
+  switch (cpp_typ) {
+    case FieldDescriptor::CPPTYPE_INT32: {
+      if (is_contiguous) {
+        int32* p = reinterpret_cast<int32*>(view->buf);
+        for (int i = 0; i < field_size; i++) {
+          *p++ = reflection->GetRepeatedInt32(*message, field_descriptor, i);
+        }
+      } else {
+        for (int i = 0; i < field_size; i++) {
+          int32* p = reinterpret_cast<int32*>(
+              InternalPyBufferPtr(view, indices));
+          *p = reflection->GetRepeatedInt32(*message, field_descriptor, i);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_UINT32: {
+      if (is_contiguous) {
+        uint32* p = reinterpret_cast<uint32*>(view->buf);
+        for (int i = 0; i < field_size; i++) {
+          *p++ = reflection->GetRepeatedUInt32(*message, field_descriptor, i);
+        }
+      } else {
+        for (int i = 0; i < field_size; i++) {
+          uint32* p = reinterpret_cast<uint32*>(
+              InternalPyBufferPtr(view, indices));
+          *p = reflection->GetRepeatedUInt32(*message, field_descriptor, i);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_INT64: {
+      if (is_contiguous) {
+        int64* p = reinterpret_cast<int64*>(view->buf);
+        for (int i = 0; i < field_size; i++) {
+          *p++ = reflection->GetRepeatedInt64(*message, field_descriptor, i);
+        }
+      } else {
+        for (int i = 0; i < field_size; i++) {
+          int64* p = reinterpret_cast<int64*>(
+              InternalPyBufferPtr(view, indices));
+          *p = reflection->GetRepeatedInt64(*message, field_descriptor, i);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_UINT64: {
+      if (is_contiguous) {
+        uint64* p = reinterpret_cast<uint64*>(view->buf);
+        for (int i = 0; i < field_size; i++) {
+          *p++ = reflection->GetRepeatedUInt64(*message, field_descriptor, i);
+        }
+      } else {
+        for (int i = 0; i < field_size; i++) {
+          uint64* p = reinterpret_cast<uint64*>(
+              InternalPyBufferPtr(view, indices));
+          *p = reflection->GetRepeatedUInt64(*message, field_descriptor, i);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_DOUBLE: {
+      if (is_contiguous) {
+        double* p = reinterpret_cast<double*>(view->buf);
+        for (int i = 0; i < field_size; i++) {
+          *p++ = reflection->GetRepeatedDouble(*message, field_descriptor, i);
+        }
+      } else {
+        for (int i = 0; i < field_size; i++) {
+          double* p = reinterpret_cast<double*>(
+              InternalPyBufferPtr(view, indices));
+          *p = reflection->GetRepeatedDouble(*message, field_descriptor, i);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_FLOAT: {
+      if (is_contiguous) {
+        float* p = reinterpret_cast<float*>(view->buf);
+        for (int i = 0; i < field_size; i++) {
+          *p++ = reflection->GetRepeatedFloat(*message, field_descriptor, i);
+        }
+      } else {
+        for (int i = 0; i < field_size; i++) {
+          float* p = reinterpret_cast<float*>(
+              InternalPyBufferPtr(view, indices));
+          *p = reflection->GetRepeatedFloat(*message, field_descriptor, i);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_BOOL: {
+      if (is_contiguous) {
+        bool* p = reinterpret_cast<bool*>(view->buf);
+        for (int i = 0; i < field_size; i++) {
+          *p++ = reflection->GetRepeatedBool(*message, field_descriptor, i);
+        }
+      } else {
+        for (int i = 0; i < field_size; i++) {
+          bool* p = reinterpret_cast<bool*>(
+              InternalPyBufferPtr(view, indices));
+          *p = reflection->GetRepeatedBool(*message, field_descriptor, i);
+        }
+      }
+      break;
+    }
+    default: {
+      PyErr_SetString(PyExc_SystemError,
+                      "Precondition of InternalExtendFromBuffer failed");
+      return NULL;
+    }
+  }
+
+  PyBuffer_Release(view);
+  Py_RETURN_NONE;
+}
+
+static PyObject* InternalExtendFromBuffer(RepeatedScalarContainer* self,
+                                          PyObject* exporter) {
+  Message* message = self->message;
+  const FieldDescriptor* field_descriptor = self->parent_field_descriptor;
+  const Reflection* reflection = message->GetReflection();
+
+  Py_buffer view[1];
+  if (PyObject_GetBuffer(exporter, view, PyBUF_FULL)) {
+    return NULL;
+  }
+
+  FieldDescriptor::CppType cpp_typ = field_descriptor->cpp_type();
+  if (InternalPyBufferCheck(view, cpp_typ)) {
+    PyBuffer_Release(view);
+    return NULL;
+  }
+
+  Py_ssize_t view_len = view->len / view->itemsize;
+  bool is_contiguous = PyBuffer_IsContiguous(view, 'C');
+  vector<Py_ssize_t> indices(view->ndim, 0);
+
+  switch (cpp_typ) {
+    case FieldDescriptor::CPPTYPE_INT32: {
+      if (is_contiguous) {
+        int32* p = reinterpret_cast<int32*>(view->buf);
+        for (int i = 0; i < view_len; i++) {
+          reflection->AddInt32(message, field_descriptor, *p++);
+        }
+      } else {
+        for (int i = 0; i < view_len; i++) {
+          int32* p = reinterpret_cast<int32*>(
+              InternalPyBufferPtr(view, indices));
+          reflection->AddInt32(message, field_descriptor, *p);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_UINT32: {
+      if (is_contiguous) {
+        uint32* p = reinterpret_cast<uint32*>(view->buf);
+        for (int i = 0; i < view_len; i++) {
+          reflection->AddUInt32(message, field_descriptor, *p++);
+        }
+      } else {
+        for (int i = 0; i < view_len; i++) {
+          uint32* p = reinterpret_cast<uint32*>(
+              InternalPyBufferPtr(view, indices));
+          reflection->AddUInt32(message, field_descriptor, *p);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_INT64: {
+      if (is_contiguous) {
+        int64* p = reinterpret_cast<int64*>(view->buf);
+        for (int i = 0; i < view_len; i++) {
+          reflection->AddInt64(message, field_descriptor, *p++);
+        }
+      } else {
+        for (int i = 0; i < view_len; i++) {
+          int64* p = reinterpret_cast<int64*>(
+              InternalPyBufferPtr(view, indices));
+          reflection->AddInt64(message, field_descriptor, *p);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_UINT64: {
+      if (is_contiguous) {
+        uint64* p = reinterpret_cast<uint64*>(view->buf);
+        for (int i = 0; i < view_len; i++) {
+          reflection->AddUInt64(message, field_descriptor, *p++);
+        }
+      } else {
+        for (int i = 0; i < view_len; i++) {
+          uint64* p = reinterpret_cast<uint64*>(
+              InternalPyBufferPtr(view, indices));
+          reflection->AddUInt64(message, field_descriptor, *p);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_DOUBLE: {
+      if (is_contiguous) {
+        double* p = reinterpret_cast<double*>(view->buf);
+        for (int i = 0; i < view_len; i++) {
+          reflection->AddDouble(message, field_descriptor, *p++);
+        }
+      } else {
+        for (int i = 0; i < view_len; i++) {
+          double* p = reinterpret_cast<double*>(
+              InternalPyBufferPtr(view, indices));
+          reflection->AddDouble(message, field_descriptor, *p);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_FLOAT: {
+      if (is_contiguous) {
+        float* p = reinterpret_cast<float*>(view->buf);
+        for (int i = 0; i < view_len; i++) {
+          reflection->AddFloat(message, field_descriptor, *p++);
+        }
+      } else {
+        for (int i = 0; i < view_len; i++) {
+          float* p = reinterpret_cast<float*>(
+              InternalPyBufferPtr(view, indices));
+          reflection->AddFloat(message, field_descriptor, *p);
+        }
+      }
+      break;
+    }
+    case FieldDescriptor::CPPTYPE_BOOL: {
+      if (is_contiguous) {
+        bool* p = reinterpret_cast<bool*>(view->buf);
+        for (int i = 0; i < view_len; i++) {
+          reflection->AddBool(message, field_descriptor, *p++);
+        }
+      } else {
+        for (int i = 0; i < view_len; i++) {
+          bool* p = reinterpret_cast<bool*>(
+              InternalPyBufferPtr(view, indices));
+          reflection->AddBool(message, field_descriptor, *p);
+        }
+      }
+      break;
+    }
+    default: {
+      PyErr_SetString(PyExc_SystemError,
+                      "Precondition of Fill failed");
+      return NULL;
+    }
+  }
+
+  PyBuffer_Release(view);
+  Py_RETURN_NONE;
+}
+
+PyObject* Extend(RepeatedScalarContainer* self, PyObject* value) {
   // TODO(ptucker): Deprecate this behavior. b/18413862
   if (value == Py_None) {
     Py_RETURN_NONE;
@@ -523,6 +904,25 @@ PyObject* Extend(RepeatedScalarContainer* self, PyObject* value) {
     return NULL;
   }
   Py_RETURN_NONE;
+}
+
+static PyObject* ExtendWithKwarg(RepeatedScalarContainer* self,
+                                 PyObject* arg, PyObject* kwarg) {
+  cmessage::AssureWritable(self->parent);
+
+  PyObject* value;
+  PyObject* from_buffer = NULL;
+  char* keywords[] = {"value", "from_buffer", NULL};
+  if (!PyArg_ParseTupleAndKeywords(
+      arg, kwarg, "O|O", keywords, &value, &from_buffer)) {
+    return NULL;
+  }
+
+  if (from_buffer != NULL && PyObject_IsTrue(from_buffer)) {
+    return InternalExtendFromBuffer(self, value);
+  } else {
+    return Extend(self, value);
+  }
 }
 
 static PyObject* Insert(RepeatedScalarContainer* self, PyObject* args) {
@@ -756,8 +1156,10 @@ static PyMethodDef Methods[] = {
     "Outputs picklable representation of the repeated field." },
   { "append", (PyCFunction)Append, METH_O,
     "Appends an object to the repeated container." },
-  { "extend", (PyCFunction)Extend, METH_O,
+  { "extend", (PyCFunction)ExtendWithKwarg, METH_VARARGS | METH_KEYWORDS,
     "Appends objects to the repeated container." },
+  { "fill", (PyCFunction)Fill, METH_O,
+    "Fills an array by numbers in the repeated container." },
   { "insert", (PyCFunction)Insert, METH_VARARGS,
     "Appends objects to the repeated container." },
   { "pop", (PyCFunction)Pop, METH_VARARGS,
